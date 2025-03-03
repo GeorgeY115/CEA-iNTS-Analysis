@@ -1,168 +1,638 @@
-#################################################################################
+################################################################################
 ################# EXTENDED COST-EFFECTIVENESS ANALYSIS MODEL ####################
+
 
 ## This model establishes the burden of disease and mortality of a disease on a
 ## population divided into wealth quintiles. It allows for the implementation of
 ## a vaccine for which there is assumed life-long immunity.
 
-## Read in data.
-x <- read.csv("Model Test Data.csv")
+
+library(mc2d)
+library(ggplot2)
+library(RColorBrewer)
+library(tidyr)
+library(dplyr)
 
 
-## Establish size of total population and per-quintile population.
-cohort_size <- 50000
-q_cohort_size <- cohort_size/5
+##### USER INPUT SECTION ######################################################
+## For constant data which does not vary by country, age, quintile etc.
+
+## Set seed. 
+set.seed(1973)
 
 
-## Establish vaccine efficacy (assumed constant across Qs) and a vector with the
-## coverages for each quintile. Multiply to get impact per quintile.
-vaccine_efficacy <- 0.85
-vaccine_coverage <- c(Q1=0.1,Q2=0.2,Q3=0.3,Q4=0.4,Q5=0.5)
-vaccine_impact <- vaccine_efficacy*vaccine_coverage
+## Establish vaccine efficacy (assumed constant across Qs).
+## veff = vaccine efficacy, vcost = vaccine cost, vduration = immunity length,
+## vprogrammelength = years of vaccinations, buildyearno = number of years it 
+## takes to reach specified coverage.
+veff <- 0.5
+vefflow <- 0.3
+veffhigh <- 0.7
+vcost <- 18
+vduration <- 10
+vprogrammelength <- 30
+buildyearno <- 5
 
 
-## Establish life expectancy.
-life_expectancy <- 70
+## Choose 0 - no waning, 1 - linear waning or 2 - exponential waning.
+waningtype <- 0
 
 
-## Establish the time frame (in years) over which the model will run.
-timestep <- seq(0,50,by=1)
+## Establish current treatment effectiveness; to be multiplied by the proportion of
+## treatment seeking individuals in each group.
+treateffect <- 0
+treateffectlow <- 0
+treateffecthigh <- 0
 
 
 ## Establish the disability weight used in the DALYs calculations.
-disweight = 0.14
+dweight <- 0.14
+dweightlow <- 0.09
+dweighthigh <- 0.19
 
 
-## Create vector which lists each quintile (simlpy 1-5). This is used for the outer
-## loop, so results can be quintile-specific.
-qunique <- unique(x$quintile)
+## Define number of iterations of PSA wanted.
+PSAits <- 1
 
 
-## Create empty dataframe in which results will be stored.
-outputtab <- data.frame(quintile=numeric(0),cases=numeric(0),deaths=numeric(0),
-                        dalys=numeric(0),cost=numeric(0),postcases=numeric(0),
-                        postdeaths=numeric(0),postdalys=numeric(0),postcost=numeric(0))
+## Run PSA? 1 = yes, 0 = no.
+PSAtoggle <- 0
 
 
-################# Start the model.
-## The outer loop iterates through each quintile.
-for (q in qunique){
+## Establish the time frame (in years) over which the model will run.
+tstep <- seq(1,39,by=1)
+
+
+##### END OF USER INPUT SECTION ###############################################
+
+
+
+
+endtab <- data.frame(country=character(0),calc=numeric(0))
+
+
+## Read in coverage, population and life expectancy files for the countries.  
+population <- read.csv("Population New.csv", header = FALSE)
+covdata <- read.csv("Coverage.csv", header = FALSE, row.names = 1)
+lexpdata <- read.csv("Lifeexp.csv", header = FALSE, row.names = 1)
+
+
+totaloutputtab <- data.frame(country=character(0),quintile=numeric(0),cases=numeric(0),deaths=numeric(0),
+                             dalys=numeric(0),cost=numeric(0),postcases=numeric(0),
+                             postdeaths=numeric(0),postdalys=numeric(0),postcost=numeric(0),
+                             vaxnum=numeric(0))
+avertedintime <- numeric(0)
+avertedinagecum <- 0
+
+overallavertedtracker <- 0
+
+country_list <- c("Benin", "Burkina Faso", "Chad", "Cote d'Ivoire", "Ghana",
+                  "Guinea", "Kenya", "Mali", "Niger", "Nigeria", "Sierra Leone",
+                  "Togo")
+
+
+##Toggled off (only for testing): 
+country_list <- c("Benin")
+
+
+## This main loop runs through every country in the analysis.
+for (z in country_list){
   
   
-  ## Subset the main data into one quintile per iteration of outer loop.
-  subq <- x[x$quintile == q, ]
-
-  
-  ## Set all the outputs to 0 between each quintile. Results stored at the end
-  ## of each one. Discount at start should be 1 (100% - results are multiplied by this).
-  total_cases <- 0
-  total_deaths <- 0
-  total_cost <- 0
-  total_dalys <- 0
-  total_cases_postvax <- 0
-  total_deaths_postvax <- 0
-  total_cost_postvax <- 0
-  total_dalys_postvax <- 0
-  discount <- 1
+  ## Read in data. Done this way so we can automatically add country name to graphs
+  ## later on in the code.
+  file_path <- paste(z, "Parameters individual years copy.csv")
+  x <- read.csv(file_path)
   
   
-  ## The previously produced vaccine impact vector has the value which is relevant
-  ## to the current quintile iteration selected.
-  vax=vaccine_impact[q]
-
+  data_title <- z
   
-  ## The mid loop iterates through the time steps over which the model runs.
-  for (t in timestep){
-
-    
-    ## The inner loop iterates through each 5-year age group. 
-    for (i in seq_along(subq$agegroup)) {
-      
-      
-      ## 'w' here represents whether those vaccinated while <5 are within the age
-      ## of the current inner loop iteration, thereby being affected by at least
-      ## partial immunity (according to the vax variable). If the programme began
-      ## 8 years ago, for example, those 13 years old or younger will be vaccinated,
-      ## so the <5 and 5-9 categories should have the full vax impact applied, the
-      ## 10-14 category should have 80% of it applied, and any older age group should
-      ## not yet experience any artificial immunity. 
-      w = i-((t+1)/5)
-      
-      if (w>1) {
-        unaff_prop <- 1
-      } else if (w<0) {
-        unaff_prop <- 0
+  
+  ## Just the population for the country of interest.
+  specpopulation <- population %>% filter(.[[1]] == z)
+  
+  
+  ## Work out coverage.
+  vcov <- covdata[data_title, ]
+  vcov <- as.numeric(vcov)
+  names(vcov) <- c("Q1","Q2","Q3","Q4","Q5")
+  
+  
+  ## Establish life expectancy in the same way as cov and pop.
+  lexp <- lexpdata[data_title, ]
+  lexp <- as.numeric(lexp)
+  
+  
+  ## Create vector which lists each quintile (simply 1-5). This is used for the outer
+  ## loop, so results can be quintile-specific.
+  qunique <- unique(x$quintile)
+  
+  
+  ## Create empty dataframes in which results will be stored.
+  outputtab <- data.frame(quintile=numeric(0),cases=numeric(0),deaths=numeric(0),
+                          dalys=numeric(0),cost=numeric(0),postcases=numeric(0),
+                          postdeaths=numeric(0),postdalys=numeric(0),postcost=numeric(0),
+                          vaxnum=numeric(0))
+  
+  
+  outputfordist <- data.frame(pre=numeric(0),post=numeric(0))
+  
+  burdendistoutput <- data.frame(burdendistb4=numeric(0),burdendistpost=numeric(0))
+  
+  
+  ## FUNCTION: Waning calculation - based on the type you selected and the age
+  ## when it is called during the loops.
+  waningcalc <- function(type,age){
+    if (type == 0){
+      if (age > vduration){
+        return(0)
       } else {
-        unaff_prop <- w
+        return(1)
       }
-
-      
-      ## Calculate the number of person years within each age category.
-      person_years <- q_cohort_size * subq$ageprop[i]
-      
-     
-      ## Calculate the number of cases pre- and post-vaccine, the latter having
-      ## the effect of the previous if statement and the vax variable applied.
-      cases <- person_years * subq$incidence[i]
-      casespostvax <- person_years * subq$incidence[i]*(unaff_prop*(1-vax))
-
-      
-      ## Calculate the number of deaths based on cases and case fatality rate.
-      deaths <- cases * subq$cfr[i]
-      deathspostvax <- casespostvax * subq$cfr[i]
-      
-      
-      ## Calculate costs, encorporating the discount rate of the current time step.
-      newcost <- (cases * subq$casecost[i])*discount
-      newcostpostvax <- (casespostvax * subq$casecost[i])*discount
-      
-      
-      ## Calculate DALYs, encorporating the discount rate of the current time step.
-      ## The life expectancy - death age is limited so it can only be above 0.
-      dalys <- (cases * disweight + deaths * pmax(0,life_expectancy-subq$avage[i]))*discount
-      dalyspostvax <- (casespostvax * disweight + casespostvax * (life_expectancy-subq$avage[i]))*discount
-      print(dalys)
-      
-      ## Keep a counter for each inner loop iteration for totals.
-      total_cases <- total_cases + cases
-      total_deaths <- total_deaths + deaths
-      total_cost <- total_cost + newcost
-      total_dalys <- total_dalys + dalys
-      
-      
-      ## Do the same for the post-vaccine ones.
-      total_cases_postvax <- total_cases_postvax + casespostvax
-      total_deaths_postvax <- total_deaths_postvax + deathspostvax
-      total_cost_postvax <- total_cost_postvax + newcostpostvax
-      total_dalys_postvax <- total_dalys_postvax + dalyspostvax
-
+    } else if (type == 1){
+      return(pmax(0,1-((1/vduration)*age)))
+    } else if (type == 2){
+      return(pmax(0,1*exp(-(1/vduration)*age)))
     }
-    
-    ## At the end of each time iteration, add a 3% discount.
-    discount <- discount * 0.97
-
   }
   
-  ## At the end of each quintile iteration, add the totals to a new row, and combine
-  ## this with the output table which was constructed before the model started running.
-  newrow <- c(q,total_cases,total_deaths,total_dalys,total_cost,total_cases_postvax,
-              total_deaths_postvax,total_dalys_postvax,total_cost_postvax)
-  outputtab <- rbind(outputtab,newrow)
-
   
-  ## Name the output table columns.
-  colnames(outputtab) <- c("Quintile", "(Pre) Cases", "(Pre) Deaths", "(Pre) DALYs", "(Pre) Cost", "(Post) Cases", "(Post) Deaths", "(Post) DALYs", "(Post) Cost")
-}
+  ## FUNCTION: Create function to do PSA sampling.
+  PSApick <- function(central, low, high) {
+    return(rpert(1, min = low, mode = central, max = high))
+  }
+  
+  
+  ## If PSA toggle is on, run it the number of iterations as previously stated, 
+  ## otherwise run through it once.
+  if (PSAtoggle == 0){
+    runs = 1
+  } else {
+    runs = PSAits
+  }
+  
+  
+  ############################# START THE MODEL ###############################
+  
+  for (p in 1:runs){
+    
+    ## Create empty dataframe into which we will paste the PSA selections, resetting
+    ## for each PSA iteration.
+    x2 <- data.frame(quintile=numeric(nrow(x)),age=character(nrow(x)),
+                     incidence=numeric(nrow(x)),cfr=numeric(nrow(x)),casecost=numeric(nrow(x)),treatprop=numeric(nrow(x)))
+    
+    
+    ## Take the corresponding highs and lows for each variable in the table which is
+    ## varied during sensitivity analysis.
+    x2 <- data.frame(quintile = x$quintile, age = x$age,
+                     incidence = mapply(PSApick, central= x$incidence, low=x$inclow, high=x$inchigh),
+                     cfr = mapply(PSApick, central= x$cfr, low=x$cfrlow, high=x$cfrhigh),
+                     ageprop = x$ageprop,
+                     casecost = mapply(PSApick, central= x$casecost, low=x$costlow, high=x$costhigh),
+                     treatprop = mapply(PSApick, central= x$treatprop, low=x$treatproplow, high=x$treatprophigh))
+    
+    
+    ## Choose either the non-PSA or PSA values for the variables which should remain
+    ## constant for all groups in a given run of the analysis.
+    if (PSAtoggle == 1) {
+      veff <- PSApick(central=veff, low=vefflow, high=veffhigh)
+      dweight <- PSApick(central=dweight, low=dweightlow, high=dweighthigh)
+      treateffect <- PSApick(central=treateffect, low=treateffectlow, high=treateffecthigh)
+    } else if (PSAtoggle == 0) {
+    }
+    
+    
+    ## Define the vaccine impact based on the effect value, whether this was selected
+    ## from PSA or just the central estimate.
+    vimp <- veff*vcov
 
 
-## Calculate percentage decrease in cases for each quintile following vaccine.
-for (i in outputtab){
-  Impact <- 100-(outputtab$`(Post) Cases`/outputtab$`(Pre) Cases`)*100
-}
-
-## Add impact column to final output.
-outputtab <- cbind(outputtab,impact)
+    ## For if you want a plot over time of the cases averted (or just of cases).
+    avertedtracker <- data.frame(Q1=numeric(0),Q2=numeric(0),Q3=numeric(0),Q4=numeric(0),Q5=numeric(0),sum=numeric(0))
 
 
-## Display the results.
-outputtab
+    ## The outer loop iterates through each quintile.    
+    for (q in qunique){
+      
+      
+      ## Choose either the non-PSA dataframe or PSA dataframe for the variables which
+      ## aren't constant across all groups in the analysis.
+      ## Subset the main data into one quintile per iteration of outer loop.
+      if (PSAtoggle == 1) {
+        subq <- x2[x2$quintile == q, ]
+      } else if (PSAtoggle == 0) {
+        subq <- x[x$quintile == q, ]
+      }
+      
+      
+      
+      ## Set all the outputs to 0 between each quintile. Results stored at the end
+      ## of each one. Discount (dis) at start should be 1 (100% - results for DALYs and costs are multiplied by this).
+      tcases <- 0
+      tdeaths <- 0
+      tcost <- 0
+      tdalys <- 0
+      tcasesafter <- 0
+      tdeathsafter <- 0
+      tcostafter <- 0
+      tdalysafter <- 0
+      dis <- 1
+      vaxnum <- 0
+      
+      
+      ## The previously produced vaccine impact vector has the value which is relevant
+      ## to the current quintile iteration selected.
+      vax <- unname(vimp[q])
+      vcovs <- unname(vcov[q])
+      
+      
+      ## The mid loop iterates through the time steps over which the model runs.
+      for (t in tstep){
+        
+        
+        ## Those who are eligible for vaccination (number vaccinated adds up in
+        ## the vaxnum bit next). Should always be 0 year element (for birth vaccinations).
+        newlyvax <- (as.numeric(specpopulation[t,3])/5)* vcovs
+        
+        
+        vcovstemp <- vcovs
+        vaxtemp <- vax 
+        vaxnum <- vaxnum + vcovstemp*newlyvax
+        
+        
+        ## The inner loop iterates through each age. 
+        for (i in seq_along(subq$age)) {
+
+          ## Establish number of people in this age group, time and quintile.
+          ## (Divided by 5 because this is just for one quintile).
+          pop <- (as.numeric(specpopulation[t,i+2]))/5
+
+          
+          ## Establish agegroups which were born AFTER the vaccination programme
+          ## finished. They should not experience immunity.
+          f <- t-vprogrammelength
+          
+
+          ## Establish ages which are within the vaccination window.
+          if (t>=(i-1) & (i-1)>=f){
+            unvax <- 0 
+          } else {
+            unvax <- 1
+          }
+
+          
+          ## Establish whether there should be a deduction in vaccination
+          ## in this age group at this particular time point if it was one of the
+          ## cohorts vaccinated during the early stages where coverage had not
+          ## reached the desired point yet.
+          earlycov <- (pmax(0.2,pmin(buildyearno,(t-i)+1)))*(1/buildyearno)
+
+          
+          ## Call the waning function written earlier.
+          waningfactor <- waningcalc(waningtype,i-1)
+          
+          
+          ## Update vaxtemp (which was in turn passed from  vax, from vimp (cov*eff)),
+          ## so that the waning is also encorporated.
+          completevax <- vaxtemp*waningfactor*earlycov
+
+          
+          ## Because it's 6 months instead of birth, halve the protection in the first
+          ## age (0 years old), and in the 11th age (10 years old).
+          if (i==1 | i==11){
+            completevax <- completevax*0.5
+          } 
+            
+          
+          ## Calculate the number of cases pre- and post-vaccine, the latter having
+          ## the effect of the previous if statement and the vax variable applied.
+          cases <- pop * subq$incidence[i]
+          casetrax <- append(casetrax,cases)
+          casesafter <- pop * unvax * subq$incidence[i] +
+            pop * (1-unvax) * (1-completevax) * subq$incidence[i]
+          
+
+          avertedinage <- cases - casesafter
+          avertedinagecum <- avertedinagecum + avertedinage
+
+
+          ## Calculate the number of deaths based on cases and case fatality rate.
+          deaths <- (cases * subq$treatprop[i] * subq$cfr[i] * (1-treateffect)) + (cases * (1-subq$treatprop[i]) * subq$cfr[i])
+          deathsafter <- (casesafter * subq$treatprop[i] * subq$cfr[i] * (1-treateffect)) +
+            (casesafter * (1-subq$treatprop[i]) * subq$cfr[i])
+          
+          
+          ## Calculate costs, encorporating the discount rate of the current time step.
+          newcost <- (cases*subq$treatprop[i]) * subq$casecost[i] * dis
+          newcostafter <- (casesafter * subq$casecost[i] * subq$treatprop[i])*dis
+          
+          
+          ## Calculate DALYs, encorporating the discount rate of the current time step.
+          ## The life expectancy - death age is limited so it can only be above 0.
+          dalys <- (cases * dweight + deaths * pmax(0,lexp-subq$age[i]))*dis
+          dalysafter <- (casesafter * dweight + deathsafter * pmax(0,lexp-subq$age[i]))*dis
+          
+          
+          ## Keep a counter for each inner loop iteration for totals.
+          tcases <- tcases + cases
+          tdeaths <- tdeaths + deaths
+          tcost <- tcost + newcost
+          tdalys <- tdalys + dalys
+          
+          
+          ## Do the same for the post-vaccine ones.
+          tcasesafter <- tcasesafter + casesafter
+          tdeathsafter <- tdeathsafter + deathsafter
+          tcostafter <- tcostafter + newcostafter
+          tdalysafter <- tdalysafter + dalysafter
+          
+          
+        } # End of age loop
+        
+        avertedintime <- rbind(avertedintime, avertedinagecum)
+        
+        avertedinagecum <- 0
+        
+        ## At the end of each time iteration, add a 3% discount.
+        dis <- dis * 0.97
+        
+        
+      } # End of time loop
+      
+      avertedintime <- as.list(avertedintime)
+      
+      avertedtracker <- rbind(avertedtracker,avertedintime)
+      
+      avertedintime <- numeric(0)
+      
+      ## At the end of each quintile iteration, add the totals to a new row, and combine
+      ## this with the output table which was constructed before the model started running.
+      newrow <- c(q,tcases,tdeaths,tdalys,tcost,tcasesafter,
+                  tdeathsafter,tdalysafter,tcostafter,vaxnum)
+      newrow
+      
+      outputtab <- rbind(outputtab,newrow)
+      
+      ## This is for all 5 quintiles per iteration; necessary for the calculation
+      ## at the end of the outside iteration loop. It is reset each iteration.
+      outputfordist <- rbind(outputfordist, data.frame(pre = newrow[[2]],post = newrow[[6]]))
+      
+      
+      ## Then reset the newrow 
+      newrow <- data.frame(
+        q = numeric(0), 
+        tcases = numeric(0), 
+        tdeaths = numeric(0), 
+        tdalys = numeric(0), 
+        tcost = numeric(0), 
+        tcasesafter = numeric(0), 
+        tdeathsafter = numeric(0), 
+        tdalysafter = numeric(0), 
+        tcostafter = numeric(0), 
+        vaxnum = numeric(0)
+      ) 
+      
+      
+      ## Name the output table columns (and for burdendist).
+      colnames(outputtab) <- c("Quintile", "(Pre) Cases", "(Pre) Deaths", "(Pre) DALYs", "(Pre) Cost", "(Post) Cases", "(Post) Deaths", "(Post) DALYs", "(Post) Cost", "Vaxnum")
+      
+      
+    } # End of quintile loop
+    
+    
+    ## Calculating the before and after burden for each quintile, for every overall
+    ## iteration of the analysis.
+    sumb4 <- sum(outputfordist[,1])
+    burdenpercentb4 <- outputfordist[,1]/sumb4
+    
+    sumpost <- sum(outputfordist[,2])
+    burdenpercentpost <- outputfordist[,2]/sumpost
+    
+    ## Creating a dataframe to output with the before and after burden for each quintile.
+    burdendist <- cbind(burdenpercentb4,burdenpercentpost)
+    
+    ## Compiling burdendist for each iteration.
+    burdendistoutput <- rbind(burdendistoutput,burdendist)
+    
+    ## Resetting the df before the next iteration so each set of quintiles is isolated
+    ## and we don't accidentally calculate the proportion of burden out of all the iterations
+    ## (would result in very low numbers).
+    burdendist[,] <- NA
+    
+    ## Resetting this one, too.
+    outputfordist <- data.frame(pre=numeric(0),post=numeric(0))
+    
+    zzaverted <- (sum(outputtab$`(Pre) Cases`))-(sum(outputtab$`(Post) Cases`))
+  }  # End of PSA iteration loop
+  
+  
+  ## Add the burdendistoutput to the overall output table.
+  outputtab <- cbind(outputtab,burdendistoutput)
+  
+  
+  
+  ## Calculate percentage decrease in cases for each quintile following vaccine.
+  for (i in outputtab){
+    impact <- 100-(outputtab$`(Post) Cases`/outputtab$`(Pre) Cases`)*100
+  }
+  
+  
+  ## Add impact column to final output.
+  outputtab <- cbind(outputtab,impact)
+  
+  
+  ## Add incremental cost (vax cost - averted health costs).
+  inccost <- (vcost*vaxnum)-(outputtab$`(Pre) Cost`- outputtab$`(Post) Cost`)
+  outputtab <- cbind(outputtab,inccost)
+  
+  
+  ## Add incremental health (DALYs before - DALYs after).
+  inchealth <- outputtab$`(Pre) DALYs`-outputtab$`(Post) DALYs`
+  outputtab <- cbind(outputtab,inchealth)
+  
+  
+  ## Add ICERs for each quintile.
+  icer <- ((vcost*vaxnum)-(outputtab$`(Pre) Cost`- outputtab$`(Post) Cost`))/(outputtab$`(Pre) DALYs`-outputtab$`(Post) DALYs`)
+  outputtab <- cbind(outputtab,icer)
+  
+  
+  ## Display the results.
+  outputtab
+  
+  
+  ## This is to produce a country label on the outputtab to be fed into totaloutputtab,
+  ## which will be the final, overall table with all the results for each quintile and each
+  ## country. It differs from outputtab in that it is a compilation of all countries.
+  laboutputtab <- cbind(Country=z,outputtab)
+  
+  totaloutputtab <- rbind(totaloutputtab,laboutputtab)
+  
+  
+  ######## Produce CE plane:
+  colours <- brewer.pal(5, "Spectral")  
+  
+  
+  ## Use the data_title variable specified at start of code.
+  graphtit <- paste("Incremental Costs and Health Gains from iNTS Vaccination by Quintile,", data_title)
+  
+  
+  
+  cea_plane <- ggplot(outputtab, aes(x = inchealth, y = inccost, color = factor(Quintile))) +
+    geom_point(alpha = 1, size = 1) +
+    scale_color_manual(values = colours) +  # Customize colors
+    labs(
+      title = graphtit,
+      x = "Incremental Health",
+      y = "Incremental Costs",
+      color = "Quintile"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top")
+  
+  cea_plane
+  
+  savetit <- paste("CEA Plane,", data_title, ".pdf")
+  ggsave(savetit, cea_plane, width=12, height=12)
+  
+  
+  ######## Produce bar chart to show the changes in proportion of burden:
+  
+  ## Split outputtab into 5 different quintile dfs.
+  quintilelist <- split(outputtab, outputtab$Quintile)
+  
+  for (i in 1:5) {
+    assign(paste0("q", i, "df"), quintilelist[[i]])
+  }
+  
+  ## For each quintile df, find the lower and upper estimates.
+  lowbound <- function(data){
+    return(quantile(data, probs=0.025))
+  }
+  
+  upbound <- function(data){
+    return(quantile(data, probs=0.975))
+  }
+  
+  barchartdata <- data.frame(
+    Quintile = character(5), 
+    LowerPre = numeric(5), 
+    MeanPre = numeric(5),
+    UpperPre = numeric(5), 
+    LowerPost = numeric(5),
+    MeanPost = numeric(5),
+    UpperPost = numeric(5),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:5){
+    qdf <- get(paste0("q",i,"df"))
+    
+    lowerpre <- lowbound(qdf$burdenpercentb4)
+    meanpre <- mean(qdf$burdenpercentb4)
+    upperpre <- upbound(qdf$burdenpercentb4)
+    lowerpost <- lowbound(qdf$burdenpercentpost)
+    meanpost <- mean(qdf$burdenpercentpost)
+    upperpost <- upbound(qdf$burdenpercentpost)
+    
+    barchartdata[i, ] <- c(paste0("Q", i), lowerpre, meanpre, upperpre, lowerpost, meanpost, upperpost)
+    
+  }
+  
+  write.csv (barchartdata, file = paste0(data_title, ".csv"))
+  
+  barchartlong <- barchartdata %>%
+    pivot_longer(cols = starts_with("Mean") | starts_with("Lower") | starts_with("Upper"),
+                 names_to = c("Measure", "Type"),
+                 names_pattern = "(.*)(Pre|Post)",
+                 values_to = "Value") %>%
+    pivot_wider(names_from = Measure, values_from = Value) %>%
+    mutate(Quintile = factor(Quintile),
+           Type = factor(Type, levels = c("Pre", "Post")))
+  
+  
+  colours <- c("Pre" = "#0B81A2", "Post" = "#E25759")
+  
+  
+  barchartlong$Mean <- as.numeric(barchartlong$Mean)
+  barchartlong$Lower <- as.numeric(barchartlong$Lower)
+  barchartlong$Upper <- as.numeric(barchartlong$Upper)
+  
+  
+  ## Create the output barchart, comparing the pre and post burden.
+  
+  barstit <- paste("iNTS by Quintile Before and After Vaccination,", data_title)
+  
+  
+  bars <- ggplot(barchartlong, aes(x = Quintile, group=Type)) +
+    geom_bar(aes(y = Mean, fill=Type), stat = "identity", position = position_dodge(width = 0.8), width = 0.6) +
+    #geom_errorbar(aes(ymin = Lower, ymax = Upper),
+    # position = position_dodge(width = 0.8), width = 0.25) +
+    labs(x = "Quintile", y = "Burden Value", title = barstit) +
+    theme_minimal() +
+    scale_fill_manual(values = colours) +  
+    scale_y_continuous(labels = scales::percent, breaks = seq(0.1, 0.45, by = 0.1))
+  
+  bars
+  
+  savebarstit <- paste("Burden Change,", data_title, ".pdf")
+  ggsave(savebarstit, bars, width=9, height=9)
+  
+  ## Compare with Jungseok:
+  row_sums <- tapply(outputtab$`(Pre) Cases`, (seq_len(nrow(outputtab)) - 1) %/% 5, sum)
+  row_sumsav <- mean(row_sums)
+  row_sums2 <- tapply(outputtab$`(Post) Cases`, (seq_len(nrow(outputtab)) - 1) %/% 5, sum)
+  row_sums2av <- mean(row_sums2)
+  
+  
+  
+  if (waningtype == 1){
+    waningname = "Linear Waning"
+  } else if (waningtype == 2){
+    waningname = "Exponential Waning"
+  } else {
+    waningname = "No Waning"
+  }
+  
+  
+  info <- paste(data_title, ",", waningname, ". Cases averted:")
+  
+  finalcalc <- row_sumsav-row_sums2av
+  
+  together <- cbind(data_title, finalcalc)
+  
+  endtab <- rbind(endtab,together)
+  
+  
+  
+} # End of whole process loop
+
+
+averted_sum <- as.data.frame(t(colSums(avertedtracker)))
+
+barchartdata$MeanPost <- as.numeric(as.character(barchartdata$MeanPost))
+barchartdata$MeanPre <- as.numeric(as.character(barchartdata$MeanPre))
+traceback()
+
+
+diffrel <- barchartdata$MeanPost - barchartdata$MeanPre
+propdiff <- diffrel/barchartdata$MeanPre 
+
+
+incordec <- barchartdata$MeanPost - barchartdata$MeanPre
+incordec <- incordec*100
+incordec <- data.frame(value = incordec, index = 1:length(incordec))
+
+
+## Plot which just shows the increase or decrease in relative burden per quintile.
+hi <- ggplot(incordec, aes(x = factor(index), y = value, fill = value > 0)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("#3A7F9F", "#D2605E")) + # Red for negative, blue for positive
+  labs(title = "Bar Chart with Negative Values Below 0", x = "Index", y = "Values") +
+  theme_minimal()
+ggsave('change bars benin.pdf', hi, width=9, height=9)
+
+casetrax
+
+warnings()
+## Trace any errors:
+traceback()
